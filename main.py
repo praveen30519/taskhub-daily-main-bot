@@ -6,12 +6,12 @@ from flask import Flask
 import telebot
 from telebot import types
 
-# 1. Background Web Server (Render 24/7 Keep-Alive)
+# 1. Background Web Server (Render Port Timeout Fix)
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "CreatorDesk Daily Bot is Running 24/7!"
+    return "Confess.Bot Daily Engine is Running 24/7!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -22,7 +22,7 @@ BOT_TOKEN = "8774903120:AAGCXoaMVckLVRbtKvHjHqAs2XT5gyXFBN4"
 ADMIN_ID = 2016851713
 
 bot = telebot.TeleBot(BOT_TOKEN)
-DATA_FILE = "creatordesk_main_db.json"
+DATA_FILE = "confess_daily_db.json"
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -409,26 +409,38 @@ def send_voucher_cmd(message):
     except:
         bot.reply_to(message, "Usage: `/sendvoucher <worker_tag> <VOUCHER_CODE>`")
 
-# --- SAFE STARTUP SEQUENCE ---
+# --- BULLETPROOF FORCE-RESET ENGINE ---
 if __name__ == "__main__":
-    # 1. Background Web Server start karein (Daemon thread)
-    t = threading.Thread(target=run_web)
-    t.daemon = True
+    # 1. Background Web Server start karein
+    t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    # 2. Webhook clear karein taaki 409 conflict na ho
+    # 2. Force session close & clear webhook updates
+    print("Executing Telegram Force-Reset...")
     try:
-        bot.remove_webhook(drop_pending_updates=True)
+        bot.close()
         time.sleep(1)
     except Exception as e:
-        print(f"Webhook note: {e}")
+        print(f"Force-close info: {e}")
 
-    # 3. Crash-proof polling loop
-    print("CreatorDesk Bot Polling Started...")
+    try:
+        bot.delete_webhook(drop_pending_updates=True)
+        time.sleep(2)
+        print("Webhook cleared & updates dropped successfully.")
+    except Exception as e:
+        print(f"Webhook cleanup info: {e}")
+
+    # 3. Crash-proof loop (Error 409 handle karne ke liye auto-cooloff)
+    print("Confess.Bot Engine Running 24/7...")
     while True:
         try:
-            bot.polling(none_stop=True, interval=1, timeout=20)
+            bot.infinity_polling(skip_pending=True, timeout=10, long_polling_timeout=5)
         except Exception as err:
-            print(f"Polling warning: {err}")
-            time.sleep(3)
+            err_str = str(err).lower()
+            if "409" in err_str or "conflict" in err_str:
+                print("409 Conflict detected: Old container stopping, waiting 10 seconds...")
+                time.sleep(10)
+            else:
+                print(f"Polling warning: {err}")
+                time.sleep(3)
     
