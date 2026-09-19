@@ -18,7 +18,8 @@ def run_web():
     app.run(host="0.0.0.0", port=port)
 
 # 2. Bot Credentials
-BOT_TOKEN = "8973435061:AAExHS9WcfoIEPit8pJoxP_8GVyqSlCJ-DY"
+BOT_TOKEN = "8774903120:AAGCXoaMVckLVRbtKvHjHqAs2XT5gyXFBN4"
+
 ADMIN_ID = 2016851713
 
 bot = telebot.TeleBot(BOT_TOKEN)
