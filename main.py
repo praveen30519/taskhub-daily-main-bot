@@ -6,39 +6,23 @@ from flask import Flask
 import telebot
 from telebot import types
 
-# 1. Background Web Server (Render Port Timeout Fix)
+# 1. Background Web Server (Render 24/7 Keep-Alive)
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "CreatorDesk Daily Bot is Running 24/7!"
-# Purana Webhook clear karne ke baad 2 second rukna
-try:
-  bot.remove_webhook(drop_pending_updates=True)
-  time.sleep(2)
-except Exception as e:
-  print(f"Webhook clear: {e}")
 
-# Web Server Render ke liye
-threading.Thread(target=run_web, daemon=True).start()
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
 
-# Single-Instance Safe Polling
-print("CreatorDesk Bot Polling Starting...")
-bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=10)
-
+# 2. Bot Credentials
 BOT_TOKEN = "8774903120:AAGCXoaMVckLVRbtKvHjHqAs2XT5gyXFBN4"
-
 ADMIN_ID = 2016851713
 
 bot = telebot.TeleBot(BOT_TOKEN)
 DATA_FILE = "creatordesk_main_db.json"
-
-# Purana Livegram Webhook saaf karna
-try:
-    bot.remove_webhook()
-    print("Purana webhook saaf kar diya gaya!")
-except Exception as e:
-    print(f"Webhook warning: {e}")
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -425,15 +409,26 @@ def send_voucher_cmd(message):
     except:
         bot.reply_to(message, "Usage: `/sendvoucher <worker_tag> <VOUCHER_CODE>`")
 
-# Flask Server Thread
-threading.Thread(target=run_web).start()
+# --- SAFE STARTUP SEQUENCE ---
+if __name__ == "__main__":
+    # 1. Background Web Server start karein (Daemon thread)
+    t = threading.Thread(target=run_web)
+    t.daemon = True
+    t.start()
 
-# Polling Loop
-print("CreatorDesk Bot Polling Running 24/7...")
-while True:
+    # 2. Webhook clear karein taaki 409 conflict na ho
     try:
-        bot.infinity_polling(timeout=20, long_polling_timeout=10)
+        bot.remove_webhook(drop_pending_updates=True)
+        time.sleep(1)
     except Exception as e:
-        print(f"Reconnect error: {e}")
-        time.sleep(3)
-      
+        print(f"Webhook note: {e}")
+
+    # 3. Crash-proof polling loop
+    print("CreatorDesk Bot Polling Started...")
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=1, timeout=20)
+        except Exception as err:
+            print(f"Polling warning: {err}")
+            time.sleep(3)
+    
