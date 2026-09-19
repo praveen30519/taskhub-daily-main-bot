@@ -12,12 +12,20 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     return "CreatorDesk Daily Bot is Running 24/7!"
+# Purana Webhook clear karne ke baad 2 second rukna
+try:
+  bot.remove_webhook(drop_pending_updates=True)
+  time.sleep(2)
+except Exception as e:
+  print(f"Webhook clear: {e}")
 
-def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+# Web Server Render ke liye
+threading.Thread(target=run_web, daemon=True).start()
 
-# 2. Bot Credentials
+# Single-Instance Safe Polling
+print("CreatorDesk Bot Polling Starting...")
+bot.infinity_polling(skip_pending=True, timeout=20, long_polling_timeout=10)
+
 BOT_TOKEN = "8774903120:AAGCXoaMVckLVRbtKvHjHqAs2XT5gyXFBN4"
 
 ADMIN_ID = 2016851713
