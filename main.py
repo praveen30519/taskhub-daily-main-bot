@@ -1,427 +1,904 @@
 import os
-import json
+import html
+import sqlite3
 import threading
 import time
+import logging
+
 from flask import Flask
 import telebot
 from telebot import types
+from telebot.apihelper import ApiTelegramException
 
-# 1. Background Web Server (Render 24/7 Port Keep-Alive)
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "BOT_TOKEN environment variable is missing. "
+        "Set BOT_TOKEN before starting the bot."
+    )
+
+try:
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "2016851713"))
+except ValueError:
+    raise RuntimeError("ADMIN_ID must be a valid integer.")
+
+DB_PATH = os.getenv("DB_PATH", "creator_bot.db")
+
+db_lock = threading.RLock()
+
+bot = telebot.TeleBot(
+    BOT_TOKEN,
+    threaded=True,
+    num_threads=4
+)
+
+
+# ============================================================
+# 2. LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
+logger = logging.getLogger("CreatorDesk")
+
+
+# ============================================================
+# 3. HELPERS
+# ============================================================
+
+def safe_html(value):
+    """Escape user-controlled text before putting it into HTML messages."""
+    if value is None:
+        return ""
+    return html.escape(str(value))
+
+
+def normalize_username(username):
+    if username:
+        return f"@{username}"
+    return "Creator"
+
+
+# ============================================================
+# 4. DATABASE
+# ============================================================
+
+ALLOWED_USER_FIELDS = {
+    "username",
+    "points",
+    "status",
+    "slot",
+    "step",
+    "name",
+    "age",
+    "city",
+    "insta",
+    "photo_id",
+    "claim_pending",
+}
+
+
+def get_db_connection():
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
+
+    conn.row_factory = sqlite3.Row
+
+    # Better SQLite behavior under concurrent access
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+
+    return conn
+
+
+def init_sqlite():
+    with db_lock:
+        conn = get_db_connection()
+
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    uid TEXT PRIMARY KEY,
+                    username TEXT,
+                    points INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'unverified',
+                    slot TEXT NOT NULL DEFAULT 'Not Set',
+                    step TEXT NOT NULL DEFAULT 'none',
+                    name TEXT DEFAULT '',
+                    age TEXT DEFAULT '',
+                    city TEXT DEFAULT '',
+                    insta TEXT DEFAULT '',
+                    photo_id TEXT DEFAULT '',
+                    claim_pending INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+
+            # Migration support for older databases
+            cursor.execute("PRAGMA table_info(users)")
+            existing_columns = {
+                row[1] for row in cursor.fetchall()
+            }
+
+            if "claim_pending" not in existing_columns:
+                cursor.execute("""
+                    ALTER TABLE users
+                    ADD COLUMN claim_pending INTEGER NOT NULL DEFAULT 0
+                """)
+
+            conn.commit()
+
+        finally:
+            conn.close()
+
+
+init_sqlite()
+
+
+def get_user(uid):
+    s_uid = str(uid)
+
+    with db_lock:
+        conn = get_db_connection()
+
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                "SELECT * FROM users WHERE uid = ?",
+                (s_uid,)
+            )
+
+            row = cursor.fetchone()
+
+            return dict(row) if row else None
+
+        finally:
+            conn.close()
+
+
+def init_user(uid, username=None):
+    s_uid = str(uid)
+    u_name = normalize_username(username)
+
+    with db_lock:
+        conn = get_db_connection()
+
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO users (
+                    uid,
+                    username,
+                    points,
+                    status,
+                    slot,
+                    step,
+                    name,
+                    age,
+                    city,
+                    insta,
+                    photo_id,
+                    claim_pending
+                )
+                VALUES (?, ?, 0, 'unverified', 'Not Set',
+                        'none', '', '', '', '', '', 0)
+            """, (s_uid, u_name))
+
+            # Update username if Telegram username changed
+            cursor.execute("""
+                UPDATE users
+                SET username = ?
+                WHERE uid = ?
+            """, (u_name, s_uid))
+
+            conn.commit()
+
+        finally:
+            conn.close()
+
+
+def update_user(uid, **kwargs):
+    if not kwargs:
+        return
+
+    invalid_fields = set(kwargs.keys()) - ALLOWED_USER_FIELDS
+
+    if invalid_fields:
+        raise ValueError(
+            f"Invalid database fields: {', '.join(invalid_fields)}"
+        )
+
+    s_uid = str(uid)
+
+    set_clause = ", ".join(
+        f"{field} = ?"
+        for field in kwargs.keys()
+    )
+
+    values = list(kwargs.values())
+    values.append(s_uid)
+
+    with db_lock:
+        conn = get_db_connection()
+
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                f"""
+                UPDATE users
+                SET {set_clause}
+                WHERE uid = ?
+                """,
+                values
+            )
+
+            conn.commit()
+
+        finally:
+            conn.close()
+
+
+def change_points(uid, amount):
+    """
+    Atomically change points.
+    Returns the new balance.
+    """
+
+    s_uid = str(uid)
+
+    with db_lock:
+        conn = get_db_connection()
+
+        try:
+            cursor = conn.cursor()
+
+            cursor.execute("BEGIN IMMEDIATE")
+
+            cursor.execute("""
+                SELECT points
+                FROM users
+                WHERE uid = ?
+            """, (s_uid,))
+
+            row = cursor.fetchone()
+
+            if not row:
+                conn.rollback()
+                return None
+
+            current_points = int(row["points"] or 0)
+
+            new_points = current_points + int(amount)
+
+            # Never allow negative points
+            new_points = max(0, new_points)
+
+            cursor.execute("""
+                UPDATE users
+                SET points = ?
+                WHERE uid = ?
+            """, (new_points, s_uid))
+
+            conn.commit()
+
+            return new_points
+
+        except Exception:
+            conn.rollback()
+            raise
+
+        finally:
+            conn.close()
+
+
+# ============================================================
+# 5. FLASK KEEP-ALIVE
+# ============================================================
+
 app = Flask(__name__)
 
-@app.route('/')
+
+@app.route("/")
 def home():
-    return "CreatorDesk Engine Active 24/7"
+    return "CreatorDesk Engine Active"
+
 
 def run_web():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", "8080"))
 
-# 2. Bot Configuration
-BOT_TOKEN = "8774903120:AAGCXoaMVckLVRbtKvHjHqAs2XT5gyXFBN4"
-ADMIN_ID = 2016851713
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        threaded=True
+    )
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
-DATA_FILE = "confess_daily_db.json"
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except:
-            return {}
-    return {}
-
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-db = load_data()
-
-def init_user(uid, username):
-    s_uid = str(uid)
-    if s_uid not in db:
-        db[s_uid] = {
-            "username": f"@{username}" if username else "Creator",
-            "points": 0,
-            "status": "unverified",
-            "slot": "Not Set",
-            "step": "none",
-            "form": {}
-        }
-        save_data(db)
+# ============================================================
+# 6. DASHBOARD
+# ============================================================
 
 def get_dashboard_menu(uid):
-    s_uid = str(uid)
-    pts = db[s_uid].get("points", 0)
+
+    user = get_user(uid)
+
+    if not user:
+        return None
+
+    points = int(user.get("points", 0) or 0)
+
     markup = types.InlineKeyboardMarkup(row_width=2)
-    btn1 = types.InlineKeyboardButton(f"💰 Balance: {pts} Pts", callback_data="btn_points")
-    btn2 = types.InlineKeyboardButton("⏰ Change Time Slot", callback_data="btn_slot")
-    btn3 = types.InlineKeyboardButton("🏆 Leaderboard", callback_data="btn_leaderboard")
-    btn4 = types.InlineKeyboardButton("🎁 Claim Amazon Voucher", callback_data="btn_claim")
-    markup.add(btn1, btn2, btn3, btn4)
+
+    markup.add(
+        types.InlineKeyboardButton(
+            f"💰 Balance: {points} Pts",
+            callback_data="btn_points"
+        ),
+        types.InlineKeyboardButton(
+            "⏰ Change Time Slot",
+            callback_data="btn_slot"
+        ),
+        types.InlineKeyboardButton(
+            "🏆 Leaderboard",
+            callback_data="btn_leaderboard"
+        ),
+        types.InlineKeyboardButton(
+            "🎁 Claim Amazon Voucher",
+            callback_data="btn_claim"
+        )
+    )
+
     return markup
 
-# --- START COMMAND ---
-@bot.message_handler(commands=['start'])
+
+def is_approved(uid):
+    user = get_user(uid)
+
+    return bool(
+        user and
+        user.get("status") == "approved"
+    )
+
+
+# ============================================================
+# 7. START
+# ============================================================
+
+@bot.message_handler(commands=["start"])
 def start_cmd(message):
+
     uid = str(message.from_user.id)
-    init_user(uid, message.from_user.username)
-    
-    status_text = "Active" if db[uid]["status"] == "approved" else "Pending Verification"
-    pts = db[uid].get("points", 0)
+
+    init_user(
+        uid,
+        message.from_user.username
+    )
+
+    user = get_user(uid)
+
+    if not user:
+        bot.send_message(
+            message.chat.id,
+            "❌ Account initialization failed. Please try again."
+        )
+        return
+
+    status_text = (
+        "Active"
+        if user["status"] == "approved"
+        else "Pending Verification"
+    )
+
+    points = int(user.get("points", 0) or 0)
+
+    first_name = safe_html(
+        message.from_user.first_name
+    )
 
     welcome_text = (
-        f"👋 *Welcome to CreatorDesk Portal, {message.from_user.first_name}!* 🌟\n\n"
+        f"👋 <b>Welcome to CreatorDesk Portal, "
+        f"{first_name}!</b> 🌟\n\n"
+
         "Aapka account successfully initialize ho chuka hai.\n\n"
-        "📌 *YOUR CREATOR PROFILE*\n"
-        f"• **Portal Status:** `{status_text}`\n"
-        f"• **Worker Tag:** `{uid}`\n"
-        f"• **Live Balance:** `{pts} Points`\n"
-        "_(Aage kisi bhi task proof ya query ke liye apna Worker Tag mention karein)_\n\n"
-        "📋 *ONBOARDING VERIFICATION*\n"
-        "Campaign tasks aur Welcome Bonus unlock karne ke liye verification mandatory hai.\n\n"
+
+        "📌 <b>YOUR CREATOR PROFILE</b>\n"
+
+        f"• <b>Portal Status:</b> "
+        f"<code>{safe_html(status_text)}</code>\n"
+
+        f"• <b>Worker Tag:</b> "
+        f"<code>{safe_html(uid)}</code>\n"
+
+        f"• <b>Live Balance:</b> "
+        f"<code>{points} Points</code>\n\n"
+
+        "📋 <b>ONBOARDING VERIFICATION</b>\n"
+
+        "Campaign tasks aur Welcome Bonus unlock "
+        "karne ke liye verification mandatory hai.\n\n"
+
         "👉 Shuru karne ke liye niche button dabayein:"
     )
 
-    markup = types.InlineKeyboardMarkup()
-    if db[uid]["status"] != "approved":
-        markup.add(types.InlineKeyboardButton("📝 Start Verification (18+)", callback_data="start_onboarding"))
+    if user["status"] != "approved":
+
+        markup = types.InlineKeyboardMarkup()
+
+        markup.add(
+            types.InlineKeyboardButton(
+                "📝 Start Verification (18+)",
+                callback_data="start_onboarding"
+            )
+        )
+
     else:
         markup = get_dashboard_menu(uid)
 
-    bot.send_message(message.chat.id, welcome_text, parse_mode="Markdown", reply_markup=markup)
-
-# --- START ONBOARDING STEPS ---
-@bot.callback_query_handler(func=lambda call: call.data == "start_onboarding")
-def start_steps(call):
-    uid = str(call.from_user.id)
-    init_user(uid, call.from_user.username)
-    db[uid]["step"] = "step_name"
-    db[uid]["form"] = {}
-    save_data(db)
-    bot.answer_callback_query(call.id)
     bot.send_message(
-        call.message.chat.id,
-        "📋 *Step 1/6: Full Legal Name*\n\nApna poora legal naam likhkar bhejein:",
-        parse_mode="Markdown"
+        message.chat.id,
+        welcome_text,
+        parse_mode="HTML",
+        reply_markup=markup
     )
 
-# --- USER MESSAGE & STEP CONTROLLER ---
-@bot.message_handler(func=lambda m: True, content_types=['text', 'photo'])
-def handle_all_messages(message):
-    uid = str(message.from_user.id)
-    init_user(uid, message.from_user.username)
 
-    # Admin Direct Anonymous Reply
+# ============================================================
+# 8. START ONBOARDING
+# ============================================================
+
+@bot.callback_query_handler(
+    func=lambda call: call.data == "start_onboarding"
+)
+def start_steps(call):
+
+    uid = str(call.from_user.id)
+
+    init_user(
+        uid,
+        call.from_user.username
+    )
+
+    update_user(
+        uid,
+        step="step_name",
+        name="",
+        age="",
+        city="",
+        insta="",
+        photo_id="",
+        claim_pending=0
+    )
+
+    bot.answer_callback_query(call.id)
+
+    bot.send_message(
+        call.message.chat.id,
+
+        "📋 <b>Step 1/6: Full Legal Name</b>\n\n"
+        "Apna poora legal naam likhkar bhejein:",
+
+        parse_mode="HTML"
+    )
+
+
+# ============================================================
+# 9. ADMIN REPLY ROUTING
+# ============================================================
+
+def extract_worker_id_from_text(text):
+
+    if not text:
+        return None
+
+    marker = "Worker Tag:"
+
+    if marker not in text:
+        return None
+
+    try:
+        after_marker = text.split(
+            marker,
+            1
+        )[1]
+
+        worker_id = (
+            after_marker
+            .strip()
+            .split()[0]
+            .replace("`", "")
+            .replace("<code>", "")
+            .replace("</code>", "")
+        )
+
+        if not worker_id.isdigit():
+            return None
+
+        return int(worker_id)
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# 10. USER INPUT ROUTER
+# ============================================================
+
+@bot.message_handler(
+    func=lambda m: True,
+    content_types=["text", "photo"]
+)
+def handle_all_messages(message):
+
+    uid = str(message.from_user.id)
+
+    init_user(
+        uid,
+        message.from_user.username
+    )
+
+    # --------------------------------------------------------
+    # ADMIN REPLY
+    # --------------------------------------------------------
+
     if message.from_user.id == ADMIN_ID:
-        if message.reply_to_message and "Worker Tag: `" in (message.reply_to_message.text or message.reply_to_message.caption or ""):
-            try:
-                full_text = message.reply_to_message.text or message.reply_to_message.caption
-                target_id = int(full_text.split("Worker Tag: `")[1].split("`")[0])
-                bot.send_message(
-                    target_id,
-                    f"💬 *Support Desk Reply:*\n\n{message.text}\n\n_(💰 Live Balance: {db[str(target_id)].get('points', 0)} Pts)_",
-                    parse_mode="Markdown"
-                )
-                bot.reply_to(message, "✅ User ko reply bhej diya gaya hai.")
-            except Exception as e:
-                bot.reply_to(message, f"❌ Error: {e}")
+
+        if not message.reply_to_message:
+            return
+
+        replied = message.reply_to_message
+
+        raw_text = (
+            replied.text
+            or replied.caption
+            or ""
+        )
+
+        target_id = extract_worker_id_from_text(
+            raw_text
+        )
+
+        if not target_id:
+            return
+
+        target_user = get_user(target_id)
+
+        if not target_user:
+            bot.reply_to(
+                message,
+                "❌ Worker database me nahi mila."
+            )
+            return
+
+        if message.content_type != "text":
+            bot.reply_to(
+                message,
+                "❌ Admin reply ke liye text message use karein."
+            )
+            return
+
+        clean_reply = safe_html(
+            message.text
+        )
+
+        target_points = int(
+            target_user.get("points", 0) or 0
+        )
+
+        try:
+
+            bot.send_message(
+                target_id,
+
+                "💬 <b>Support Desk Reply:</b>\n\n"
+                f"{clean_reply}\n\n"
+                f"<i>💰 Live Balance: "
+                f"{target_points} Pts</i>",
+
+                parse_mode="HTML"
+            )
+
+            bot.reply_to(
+                message,
+                "✅ User ko reply bhej diya gaya hai."
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Failed to send admin reply"
+            )
+
+            bot.reply_to(
+                message,
+                f"❌ Reply bhejne me error: "
+                f"{safe_html(exc)}"
+            )
+
         return
 
-    current_step = db[uid].get("step", "none")
+    # --------------------------------------------------------
+    # USER FLOW
+    # --------------------------------------------------------
+
+    user = get_user(uid)
+
+    if not user:
+        return
+
+    current_step = user.get(
+        "step",
+        "none"
+    )
+
+    # ========================================================
+    # STEP 1 - NAME
+    # ========================================================
 
     if current_step == "step_name":
-        if message.content_type != 'text':
-            bot.reply_to(message, "❌ Kripya text me apna naam likhein.")
-            return
-        db[uid]["form"]["name"] = message.text
-        db[uid]["step"] = "step_age"
-        save_data(db)
-        bot.send_message(message.chat.id, "📋 *Step 2/6: Age (18+ only)*\n\nApni umar (Age) number me enter karein:", parse_mode="Markdown")
-        return
 
-    elif current_step == "step_age":
-        if not message.text or not message.text.strip().isdigit() or int(message.text.strip()) < 18:
-            bot.reply_to(message, "⚠️ Is platform ke liye 18+ hona anivarya hai. Kripya valid 18+ age enter karein:")
-            return
-        db[uid]["form"]["age"] = message.text.strip()
-        db[uid]["step"] = "step_city"
-        save_data(db)
-        bot.send_message(message.chat.id, "📋 *Step 3/6: Current City*\n\nApna current shehar (City) likhkar bhejein:", parse_mode="Markdown")
-        return
-
-    elif current_step == "step_city":
-        if message.content_type != 'text':
-            bot.reply_to(message, "❌ Kripya city ka naam likhein.")
-            return
-        db[uid]["form"]["city"] = message.text
-        db[uid]["step"] = "step_insta"
-        save_data(db)
-        bot.send_message(message.chat.id, "📋 *Step 4/6: Active Instagram Handle*\n\nApna Instagram username (e.g. `@username`) bhejein:", parse_mode="Markdown")
-        return
-
-    elif current_step == "step_insta":
-        if message.content_type != 'text':
-            bot.reply_to(message, "❌ Kripya apna Instagram handle likhein.")
-            return
-        db[uid]["form"]["insta"] = message.text
-        db[uid]["step"] = "step_photo"
-        save_data(db)
-        bot.send_message(
-            message.chat.id,
-            "📋 *Step 5/6: 4/5 Pose Photo*\n\n"
-            "📸 Kripya apni clear *Pose Photo* upload karein.\n"
-            "⚠️ *Dhyan rahe: Jab tak aap photo upload nahi karenge, verification process aage nahi badhega.*",
-            parse_mode="Markdown"
-        )
-        return
-
-    elif current_step == "step_photo":
-        if message.content_type != 'photo':
-            bot.reply_to(message, "🚫 *Photo zaroori hai!* Kripya apni photo upload karein, text allow nahi hai.")
-            return
-        db[uid]["form"]["photo_id"] = message.photo[-1].file_id
-        db[uid]["step"] = "step_consent"
-        save_data(db)
-        bot.send_message(
-            message.chat.id,
-            "📋 *Step 6/6: 🔞 ELIGIBILITY & CONSENT*\n\n"
-            "Is platform ke tasks aur guidelines ke mutabik aapka 18+ hona anivarya hai.\n\n"
-            "Confirmation ke liye neeche diya gaya exact text likhkar bhejein:\n"
-            "👉 `AGREE - 18+`",
-            parse_mode="Markdown"
-        )
-        return
-
-    elif current_step == "step_consent":
-        if not message.text or message.text.strip().upper() != "AGREE - 18+":
-            bot.reply_to(message, "⚠️ Confirmation ke liye exactly `AGREE - 18+` likhkar send karein.")
-            return
-        
-        db[uid]["step"] = "completed_pending"
-        save_data(db)
-
-        markup = types.InlineKeyboardMarkup()
-        markup.add(
-            types.InlineKeyboardButton("✅ Approve Profile", callback_data=f"adm_app_{uid}"),
-            types.InlineKeyboardButton("❌ Reject Profile", callback_data=f"adm_rej_{uid}")
-        )
-        
-        caption_details = (
-            "📋 *NEW ONBOARDING SUBMISSION*\n"
-            f"• **Name:** {db[uid]['form'].get('name')}\n"
-            f"• **Age:** {db[uid]['form'].get('age')}\n"
-            f"• **City:** {db[uid]['form'].get('city')}\n"
-            f"• **Instagram:** {db[uid]['form'].get('insta')}\n"
-            f"• **Consent:** Confirmed (18+)\n"
-            f"• **Worker Tag:** `{uid}`\n"
-            f"• **Telegram User:** {db[uid].get('username')}"
-        )
-        
-        bot.send_photo(ADMIN_ID, db[uid]["form"]["photo_id"], caption=caption_details, parse_mode="Markdown", reply_markup=markup)
-
-        bot.send_message(
-            message.chat.id,
-            "✅ *Details Successfully Submitted!*\n\n"
-            "⚠️ **Verification Guidelines:**\n"
-            "• Details submit hote hi profile review team verify karegi.\n"
-            "• Approval ke baad aapka ₹250 Welcome Bonus credit ho jayega.\n"
-            "• Payouts instant Amazon Pay Vouchers ke through release hote hain.\n\n"
-            "Kripya approval ka intezar karein.",
-            parse_mode="Markdown"
-        )
-        return
-
-    pts = db[uid].get("points", 0)
-    admin_box = (
-        f"📩 *Incoming Message*\n"
-        f"👤 From: {db[uid].get('username')}\n"
-        f"🆔 Worker Tag: `{uid}`\n"
-        f"💰 Live Balance: `{pts} Pts`\n\n"
-        f"💬 {message.text if message.content_type == 'text' else '[Photo/File Sent]'}"
-    )
-    bot.send_message(ADMIN_ID, admin_box, parse_mode="Markdown")
-    bot.reply_to(message, f"✅ Message admin team ko bhej diya gaya hai.\n_(Aapka Live Balance: {pts} Pts)_")
-
-# --- ADMIN APPROVE/REJECT BUTTONS ---
-@bot.callback_query_handler(func=lambda call: call.data.startswith("adm_"))
-def admin_verification_decision(call):
-    if call.from_user.id != ADMIN_ID:
-        return
-    bot.answer_callback_query(call.id)
-    action, target_uid = call.data.split("_")[1], call.data.split("_")[2]
-
-    if action == "app":
-        db[target_uid]["status"] = "approved"
-        db[target_uid]["points"] = db[target_uid].get("points", 0) + 50
-        save_data(db)
-        
-        bot.send_message(
-            int(target_uid),
-            "🎉 *Badhai ho! Aapki Creator Profile APPROVE ho gayi hai!*\n\n"
-            "Aapka Welcome Bonus credit ho chuka hai. Niche diye gaye menu se time slot aur details manage karein.",
-            parse_mode="Markdown",
-            reply_markup=get_dashboard_menu(target_uid)
-        )
-        bot.edit_message_caption("✅ *Profile Approved & Bonus Credited*", chat_id=ADMIN_ID, message_id=call.message.message_id)
-
-    elif action == "rej":
-        db[target_uid]["status"] = "unverified"
-        db[target_uid]["step"] = "none"
-        save_data(db)
-        
-        bot.send_message(
-            int(target_uid),
-            "❌ *Verification Update:*\n\nAapki profile review me reject ho gayi hai (photo clear na hone ya galat details ke karan).\n\nDobara form bharne ke liye `/start` karein.",
-            parse_mode="Markdown"
-        )
-        bot.edit_message_caption("❌ *Profile Rejected*", chat_id=ADMIN_ID, message_id=call.message.message_id)
-
-# --- TIME SLOTS ---
-@bot.callback_query_handler(func=lambda call: call.data == "btn_slot")
-def select_slot(call):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    btn_noon = types.InlineKeyboardButton("☀️ Dopahar: 01:00 PM - 03:00 PM", callback_data="slot_01to03pm")
-    btn_night = types.InlineKeyboardButton("🌙 Raat: 09:00 PM - 12:00 AM", callback_data="slot_09to12am")
-    markup.add(btn_noon, btn_night)
-    bot.send_message(call.message.chat.id, "⏰ *Apna working time slot chunein:*", parse_mode="Markdown", reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("slot_"))
-def save_slot(call):
-    uid = str(call.from_user.id)
-    slot_mapping = {
-        "slot_01to03pm": "01:00 PM - 03:00 PM (Dopahar)",
-        "slot_09to12am": "09:00 PM - 12:00 AM (Raat)"
-    }
-    chosen_slot = slot_mapping.get(call.data, "09:00 PM - 12:00 AM")
-    db[uid]["slot"] = chosen_slot
-    save_data(db)
-    bot.answer_callback_query(call.id)
-    bot.send_message(call.message.chat.id, f"✅ Aapka Time Slot successfully set ho gaya hai:\n📍 *{chosen_slot}*", parse_mode="Markdown")
-    bot.send_message(ADMIN_ID, f"⏰ *Slot Update:*\nWorker Tag: `{uid}` ({db[uid].get('username')}) ne slot `{chosen_slot}` select kiya.", parse_mode="Markdown")
-
-# --- POINTS & REWARDS DASHBOARD ---
-@bot.callback_query_handler(func=lambda call: call.data == "btn_points")
-def view_points(call):
-    uid = str(call.from_user.id)
-    pts = db[uid].get("points", 0)
-    slot = db[uid].get("slot", "Not Set")
-    bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        f"📊 *YOUR CREATOR WALLET*\n\n"
-        f"• **Current Points:** `{pts}` / 100\n"
-        f"• **Active Slot:** {slot}\n"
-        f"• **Status:** {db[uid].get('status', 'Pending').capitalize()}\n\n"
-        "_(100 Points hote hi aap Amazon Pay Gift Card claim kar sakte hain)_",
-        parse_mode="Markdown"
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data == "btn_leaderboard")
-def view_leaderboard(call):
-    bot.answer_callback_query(call.id)
-    sorted_users = sorted(db.items(), key=lambda x: x[1].get("points", 0), reverse=True)[:10]
-    board = "🏆 *Top Creators Leaderboard:*\n\n"
-    for i, (k, v) in enumerate(sorted_users, 1):
-        board += f"{i}. {v.get('username', 'Creator')} — `{v.get('points', 0)} Pts`\n"
-    bot.send_message(call.message.chat.id, board, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data == "btn_claim")
-def claim_reward(call):
-    uid = str(call.from_user.id)
-    pts = db[uid].get("points", 0)
-    bot.answer_callback_query(call.id)
-
-    if pts < 100:
-        bot.send_message(
-            call.message.chat.id,
-            f"❌ *Claim Not Allowed!*\n\nAapke wallet me abhi sirf *{pts} Points* hain. Minimum *100 Points* hone ke baad hi Amazon Gift Card release hota hai.",
-            parse_mode="Markdown"
-        )
-    else:
-        bot.send_message(call.message.chat.id, "✅ *Redeem Request Sent!*\n\nAdmin verification ke baad Amazon Pay Voucher code yahan deliver karenge.", parse_mode="Markdown")
-        bot.send_message(
-            ADMIN_ID,
-            f"🎁 *New Voucher Claim Request!*\n"
-            f"• Worker Tag: `{uid}` ({db[uid].get('username')})\n"
-            f"• Points: `{pts}`\n\n"
-            f"Voucher code bhejne ke liye command use karein:\n"
-            f"`/sendvoucher {uid} AMAZON_CODE_HERE`",
-            parse_mode="Markdown"
-        )
-
-# --- ADMIN COMMANDS ---
-@bot.message_handler(commands=['setpoints'])
-def set_points_cmd(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        _, target_uid, pts = message.text.split()
-        target_uid = str(target_uid)
-        pts = int(pts)
-        if target_uid in db:
-            db[target_uid]["points"] = pts
-            save_data(db)
-            bot.reply_to(message, f"✅ Worker `{target_uid}` ke points `{pts}` set ho gaye.")
-            bot.send_message(int(target_uid), f"🔔 *Wallet Updated:* Aapka balance ab `{pts} Points` ho chuka hai.", parse_mode="Markdown")
-    except:
-        bot.reply_to(message, "Usage: `/setpoints <worker_tag> <points>`")
-
-@bot.message_handler(commands=['addpoints'])
-def add_points_cmd(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        _, target_uid, pts = message.text.split()
-        target_uid = str(target_uid)
-        pts = int(pts)
-        if target_uid in db:
-            db[target_uid]["points"] = db[target_uid].get("points", 0) + pts
-            save_data(db)
-            bot.reply_to(message, f"✅ Worker `{target_uid}` me +{pts} add ho gaye. (Total: {db[target_uid]['points']})")
-            bot.send_message(int(target_uid), f"🎁 *Points Credited:* +{pts} Points add hue!\nTotal Balance: `{db[target_uid]['points']}` Pts", parse_mode="Markdown")
-    except:
-        bot.reply_to(message, "Usage: `/addpoints <worker_tag> <points>`")
-
-@bot.message_handler(commands=['sendvoucher'])
-def send_voucher_cmd(message):
-    if message.from_user.id != ADMIN_ID:
-        return
-    try:
-        parts = message.text.split(maxsplit=2)
-        target_uid = str(parts[1])
-        voucher_code = parts[2]
-        
-        if target_uid in db:
-            db[target_uid]["points"] = max(0, db[target_uid].get("points", 0) - 100)
-            save_data(db)
-            bot.send_message(
-                int(target_uid),
-                f"🎉 *Badhai ho! Aapka Amazon Pay Gift Card aa gaya hai:*\n\n"
-                f"🏷️ **Voucher Code:** `{voucher_code}`\n\n"
-                f"Aap ise apne Amazon App me jakar *Amazon Pay > Add Gift Card* me add kar sakte hain.\n"
-                f"_(Bacha hua Balance: {db[target_uid]['points']} Pts)_",
-                parse_mode="Markdown"
+        if message.content_type != "text":
+            bot.reply_to(
+                message,
+                "❌ Kripya text me apna naam likhein."
             )
-            bot.reply_to(message, f"✅ Voucher code safely bhej diya gaya aur 100 points deduct ho gaye.")
-    except:
-        bot.reply_to(message, "Usage: `/sendvoucher <worker_tag> <VOUCHER_CODE>`")
+            return
 
-# --- ZERO-LAG AUTO-STABILIZER ENGINE ---
-if __name__ == "__main__":
-    # 1. Background web server start
-    t = threading.Thread(target=run_web, daemon=True)
-    t.start()
+        name = message.text.strip()
 
-    # 2. Reset connection cleanly
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-    except:
-        pass
+        if not name or len(name) > 100:
+            bot.reply_to(
+                message,
+                "❌ Kripya valid naam enter karein."
+            )
+            return
 
-    # 3. Direct Zero-Lag Threaded Polling
-    print("Zero-Lag Engine Online...")
-    bot.polling(none_stop=True, interval=0, timeout=30)
-    
+        update_user(
+            uid,
+            name=name,
+            step="step_age"
+        )
+
+        bot.send_message(
+            message.chat.id,
+
+            "📋 <b>Step 2/6: Age (18+ only)</b>\n\n"
+            "Apni umar number me enter karein:",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # ========================================================
+    # STEP 2 - AGE
+    # ========================================================
+
+    if current_step == "step_age":
+
+        if message.content_type != "text":
+            bot.reply_to(
+                message,
+                "❌ Kripya age number me enter karein."
+            )
+            return
+
+        age_text = message.text.strip()
+
+        if not age_text.isdigit():
+
+            bot.reply_to(
+                message,
+                "⚠️ Kripya valid age enter karein."
+            )
+            return
+
+        age = int(age_text)
+
+        if age < 18 or age > 120:
+
+            bot.reply_to(
+                message,
+                "⚠️ Is platform ke liye 18+ hona anivarya hai. "
+                "Kripya valid 18+ age enter karein."
+            )
+            return
+
+        update_user(
+            uid,
+            age=str(age),
+            step="step_city"
+        )
+
+        bot.send_message(
+            message.chat.id,
+
+            "📋 <b>Step 3/6: Current City</b>\n\n"
+            "Apna current shehar likhkar bhejein:",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # ========================================================
+    # STEP 3 - CITY
+    # ========================================================
+
+    if current_step == "step_city":
+
+        if message.content_type != "text":
+
+            bot.reply_to(
+                message,
+                "❌ Kripya city ka naam likhein."
+            )
+            return
+
+        city = message.text.strip()
+
+        if not city or len(city) > 100:
+
+            bot.reply_to(
+                message,
+                "❌ Kripya valid city enter karein."
+            )
+            return
+
+        update_user(
+            uid,
+            city=city,
+            step="step_insta"
+        )
+
+        bot.send_message(
+            message.chat.id,
+
+            "📋 <b>Step 4/6: Instagram Handle</b>\n\n"
+            "Apna Instagram username bhejein "
+            "(example: <code>@username</code>):",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # ========================================================
+    # STEP 4 - INSTAGRAM
+    # ========================================================
+
+    if current_step == "step_insta":
+
+        if message.content_type != "text":
+
+            bot.reply_to(
+                message,
+                "❌ Kripya Instagram handle likhein."
+            )
+            return
+
+        insta = message.text.strip()
+
+        if not insta or len(insta) > 100:
+
+            bot.reply_to(
+                message,
+                "❌ Kripya valid Instagram handle enter karein."
+            )
+            return
+
+        update_user(
+            uid,
+            insta=insta,
+            step="step_photo"
+        )
+
+        bot.send_message(
+            message.chat.id,
+
+            "📋 <b>Step 5/6: Pose Photo</b>\n\n"
+
+            "📸 Kripya apni clear "
+            "<b>Pose Photo</b> upload karein.\n\n"
+
+            "⚠️ Photo upload kiye bina "
+            "verification complete nahi hogi.",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # ========================================================
+    # STEP 5 - PHOTO
+    # ========================================================
+
+    if current_step == "step_photo":
+
+        if message.content_type != "photo":
+
+            bot.reply_to(
+                message,
+                "🚫 <b>Photo zaroori hai!</b>\n"
+                "Kripya photo upload karein.",
+
+                parse_mode="HTML"
+            )
+
+            return
+
+        photo_id = message.photo[-1].file_id
+
+        update_user(
+            uid,
+            photo_id=photo_id,
+            step="step_consent"
+        )
+
+        bot.send_message(
+            message.chat.id,
+
+            "📋 <b>Step 6/6: Eligibility & Consent</b>\n\n"
+
+            "Is platform ke tasks ke liye "
+            "18+ hona anivarya hai.\n\n"
+
+            "Confirmation ke liye exact text bhejein:\n\n"
+
+            "👉 <code>AGREE - 18+</code>",
+
+            parse_mode="HTML"
+        )
+
+        return
+
+    # ========================================================
+    # STEP 6 - CONSENT
+    # ========================================================
+
+    if current_step == "step_consent":
+
+        if (
+            message.content_type != "text"
+            or message.text.strip().upper()
+            != "AGREE - 18+"
+        ):
+
+            bot.reply_to(
+                message,
+
+                "⚠️ Confirmation ke liye exactly "
+                "<code>AGREE - 18+</code> "
+                "likhkar send karein.",
+
+                parse_mode="HTML"
+            )
+
+            return
+
+        update_user(
+            uid,
+            step="completed_pending"
+        )
+
+        u_data = get_user(uid)
+
+        if not u_data or not u_data.get("photo_id"):
+            bot.send_message(
+                message.chat.id,
+                "❌ Photo data missing hai. Please /start se dobara try karein."
+    )
