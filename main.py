@@ -6,22 +6,22 @@ from flask import Flask
 import telebot
 from telebot import types
 
-# 1. Background Web Server (Render Port Timeout Fix)
+# 1. Background Web Server (Render 24/7 Port Keep-Alive)
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Confess.Bot Daily Engine is Running 24/7!"
+    return "CreatorDesk Engine Active 24/7"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
 
-# 2. Bot Credentials
+# 2. Bot Configuration
 BOT_TOKEN = "8774903120:AAGCXoaMVckLVRbtKvHjHqAs2XT5gyXFBN4"
 ADMIN_ID = 2016851713
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 DATA_FILE = "confess_daily_db.json"
 
 def load_data():
@@ -279,7 +279,7 @@ def admin_verification_decision(call):
         )
         bot.edit_message_caption("❌ *Profile Rejected*", chat_id=ADMIN_ID, message_id=call.message.message_id)
 
-# --- TIME SLOTS (2 Options) ---
+# --- TIME SLOTS ---
 @bot.callback_query_handler(func=lambda call: call.data == "btn_slot")
 def select_slot(call):
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -352,7 +352,7 @@ def claim_reward(call):
             parse_mode="Markdown"
         )
 
-# --- ADMIN COMMANDS: SET/ADD POINTS & SEND VOUCHER ---
+# --- ADMIN COMMANDS ---
 @bot.message_handler(commands=['setpoints'])
 def set_points_cmd(message):
     if message.from_user.id != ADMIN_ID:
@@ -409,38 +409,19 @@ def send_voucher_cmd(message):
     except:
         bot.reply_to(message, "Usage: `/sendvoucher <worker_tag> <VOUCHER_CODE>`")
 
-# --- BULLETPROOF FORCE-RESET ENGINE ---
+# --- ZERO-LAG AUTO-STABILIZER ENGINE ---
 if __name__ == "__main__":
-    # 1. Background Web Server start karein
+    # 1. Background web server start
     t = threading.Thread(target=run_web, daemon=True)
     t.start()
 
-    # 2. Force session close & clear webhook updates
-    print("Executing Telegram Force-Reset...")
-    try:
-        bot.close()
-        time.sleep(1)
-    except Exception as e:
-        print(f"Force-close info: {e}")
-
+    # 2. Reset connection cleanly
     try:
         bot.delete_webhook(drop_pending_updates=True)
-        time.sleep(2)
-        print("Webhook cleared & updates dropped successfully.")
-    except Exception as e:
-        print(f"Webhook cleanup info: {e}")
+    except:
+        pass
 
-    # 3. Crash-proof loop (Error 409 handle karne ke liye auto-cooloff)
-    print("Confess.Bot Engine Running 24/7...")
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=10, long_polling_timeout=5)
-        except Exception as err:
-            err_str = str(err).lower()
-            if "409" in err_str or "conflict" in err_str:
-                print("409 Conflict detected: Old container stopping, waiting 10 seconds...")
-                time.sleep(10)
-            else:
-                print(f"Polling warning: {err}")
-                time.sleep(3)
+    # 3. Direct Zero-Lag Threaded Polling
+    print("Zero-Lag Engine Online...")
+    bot.polling(none_stop=True, interval=0, timeout=30)
     
